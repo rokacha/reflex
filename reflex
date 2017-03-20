@@ -1,0 +1,291 @@
+#!/usr/bin/python
+import sys, os
+import getopt
+import shlex
+import termios
+import contextlib
+from subprocess import Popen, PIPE
+from threading import Thread
+from pynput.keyboard import Key, Listener,KeyCode
+import shutil
+
+T_CLASS = None
+ctrl_pressed = False
+IMAGE_NAME="reflexapp:latest"
+ORIGINAL_CONT_NAME = "original_container"
+CP_NAME = "checkpoint1"
+CP_CONT_NAME = "dup_container"
+P_DUP = "23343"
+shouldClean = True
+shouldCleanDockerfile = False
+verbose = False
+ports = ""
+
+
+def main():
+    global IMAGE_NAME, ORIGINAL_CONT_NAME, verbose, ports,T_CLASS
+
+    verbose,dirname,filename,T_CLASS = handle_options()
+    
+    isExperimental()
+
+    if not os.path.isfile("Dockerfile"):
+        make_dockerfile()
+    
+    ports = getPorts()
+
+    print("Building Image \""+IMAGE_NAME+"\"")
+    build_main_image()
+    
+    with Listener( on_press=on_press, on_release=on_release) as listener:
+        run_main_container()
+
+        print("Listening for keyboard input (Press Ctrl+R for reflex or Esc to exit)")
+        listener.join()
+
+    clean_environment()
+
+
+
+#-----------------------ASSISTANT FUNCTIONS---------------------------#
+def run_main_container():
+    global ports,ORIGINAL_CONT_NAME,IMAGE_NAME,verbose
+
+    run_str = "docker run -d --rm "
+    for p in ports:
+        if p.strip() not in (None, ""):
+            run_str += "-p "+p+":"+p+" "
+    
+    run_str+= "--name "+ORIGINAL_CONT_NAME+" " +IMAGE_NAME
+
+    _,ps_out,_ = get_exitcode_stdout_stderr("docker ps -q -f \"name="+ORIGINAL_CONT_NAME+"\"" ,False)
+    if ps_out not in (None,""):
+        print "    found uncleaned duplicate container " + ps_out
+        cl_ecode,cl_out,cl_err = get_exitcode_stdout_stderr("docker rm -f "+ps_out,False)
+    
+    run_ecode,run_out,run_err = get_exitcode_stdout_stderr(run_str,verbose)
+
+def build_main_image():
+    global IMAGE_NAME
+    build_ecode,build_out,build_err = get_exitcode_stdout_stderr("docker build --rm -t "+IMAGE_NAME+" .",True)
+
+def clean_environment():
+    global shouldClean,shouldCleanDockerfile,verbose
+
+    if shouldClean:
+        if shouldCleanDockerfile:
+            os.remove("Dockerfile")   
+        get_exitcode_stdout_stderr("docker stop "+ORIGINAL_CONT_NAME,verbose)
+        if os.path.isdir(CP_NAME):
+            shutil.rmtree(CP_NAME)
+
+def perform_duplication():
+    global ORIGINAL_CONT_NAME, CP_NAME, CP_CONT_NAME, verbose
+
+    print("Received reflex request")
+    _,pwd,_ = get_exitcode_stdout_stderr("pwd",False)
+    # print "pwd = ",pwd
+    if os.path.isdir(CP_NAME):
+        shutil.rmtree(CP_NAME)
+    
+    cp_ecode,cp_out,cp_err = get_exitcode_stdout_stderr(
+        "docker checkpoint create --leave-running --checkpoint-dir="+pwd+ ORIGINAL_CONT_NAME+" " +CP_NAME
+        ,verbose)
+
+    print("Stopped container and checkpointed\n"+
+            "   Named checkpoint "+CP_NAME+"\n"+
+            "   In folder "+pwd)
+
+def v_print(s):
+    global verbose
+    if verbose:
+        print s
+
+
+def my_import(name):
+    components = name.split('.')
+    mod = __import__(components[0])
+    for comp in components[1:]:
+        mod = getattr(mod, comp)
+    return mod
+
+def handle_options():
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "hvT:d:t:", ["help","verbose","Tester=","directory=","target="])
+       # print opts
+
+    except getopt.GetoptError, err:
+        print str(err)
+        usage()
+        sys.exit(2)
+
+    verbose = False
+    dirname= "."
+    filename =  None
+    tester_class = None
+
+    for o, a in opts:
+        if o in ("-T","--Tester"):
+            try:
+                klass = my_import(a)
+                tester_class = klass()
+            except ImportError:
+                print >>sys.stderr, "cant load "+a
+        elif o in ("-v","--verbose"):
+            verbose = True
+        elif o in ("-h", "--help"):
+            usage()
+            sys.exit()
+        elif o in ("-d", "--directory"):
+            dirname = a
+            print "dirname = ",dirname
+        elif o in ("-t", "--target"):
+            filename = a
+        else:
+            print >>sys.stderr, "dont recognize option ("+o+","+a+")"
+            assert False, "unhandled option"
+
+            sys.exit(2)
+
+    if tester_class == None:
+        print >>sys.stderr, "must specify class of tester"
+        sys.exit(2)
+
+    return (verbose,dirname,filename,tester_class)
+
+
+def usage():
+    print >>sys.stderr, ("Mandatory:\n"+
+                        "-T [--Tester] the tester class that should be loaded\n\n"+
+                        "Optional flags:\n"+
+                        "-d [--directory] \n"+
+                        "-h [--help] get help about the use\n"+
+                        "-v [--verbose] verbosity flag\n"+
+                        "-t [--target] specify the executable (Java main class for now)")
+
+def get_exitcode_stdout_stderr(cmd,verbose):
+    args = shlex.split(cmd)
+    if verbose:
+        proc = Popen(args, stdout=sys.stdout, stderr=sys.stderr, stdin=PIPE)
+    else:
+        proc = Popen(args, stdout=PIPE, stderr=PIPE)
+    out, err = proc.communicate()
+    exitcode = proc.returncode
+
+    return exitcode, out, err
+
+def isExperimental():
+    exitcode, out, err = get_exitcode_stdout_stderr("docker info",False)
+    experimental = False
+    for s in str.split(out,"\n"):
+        if "Experimental" in s:
+            experimental = str2bool(str.split(s,": ")[1])
+    
+    if not experimental:
+        print >> sys.stderr, ("Docker is not in experimental mode.\n"
+                          "Checkpoint creation and reloading is only supported "
+                           "(for now) in Experimental mode")
+        sys.exit(2)
+
+def getIp(container):
+    _,ip_out,_ = get_exitcode_stdout_stderr("docker container port "+container,False)
+    return ip_out.split("->")[1].split(":")[0]
+
+
+def getPorts():
+    
+    f = open("Dockerfile","r")
+    dockerfile = f.read()
+    v_print("using Dockerfile:\n"+
+                    "------------------------------------------------\n\n"+
+                    dockerfile+"\n"+
+                    "------------------------------------------------\n")
+    f.close()
+
+    for s in str.split(dockerfile,"\n"):
+        if "expose" in s.lower():
+            return s.split(" ")[1:]
+    return ""
+
+def str2bool(v):
+  return v.lower() in ("yes", "true", "t", "1")
+
+def dockerfile_java(filename, foldername):
+    global shouldCleanDockerfile
+
+    file = ("FROM java:7\n"+
+        "COPY "+foldername+" /home/userapp/\n"+
+        "WORKDIR /home/userapp\n"+
+        "RUN javac "+filename+"\n"+
+        "CMD [\"java\", \""+filename[:-5]+"\"]")
+
+    if (filename == None or not os.path.isfile(filename)):
+        print >> sys.stderr, " target undefined well"
+    v_print("undefined Dockerfile, one is created.")
+    f = open("Dockerfile","w+")
+    f.write(file)
+    shouldCleanDockerfile=True
+    f.close()   
+
+
+
+def on_press(key):
+    global ctrl_pressed,P_DUP,CP_CONT_NAME,T_CLASS,ORIGINAL_CONT_NAME
+
+    if key == Key.ctrl:
+        ctrl_pressed = True
+    if key in [KeyCode.from_char('r') ,KeyCode.from_char('R')] and ctrl_pressed:
+        perform_duplication()
+        ip = getIp(ORIGINAL_CONT_NAME)
+        x=0
+        while(T_CLASS.should_continue_testing()):
+            print "---------------test-"+str(x)+"-----------------------"
+            temp_cont_name = CP_CONT_NAME+str(x)
+            x+=1
+            v_print("checking if a container name conflict exists...")
+            remove_old_container(temp_cont_name)
+            create_and_run_duplicated_container(temp_cont_name,P_DUP)
+            T_CLASS.perform_test(ip,P_DUP)
+            print "--------------------------------------"
+
+        return False
+
+
+def remove_old_container(name):
+    _,dup_out,_ = get_exitcode_stdout_stderr("docker ps -q -f \"name="+name+"\"" ,False)
+
+    if dup_out not in (None,""):
+        v_print("   cleaning container " + dup_out.strip())     
+        cl_ecode,cl_out,cl_err = get_exitcode_stdout_stderr("docker rm  -f "+dup_out,False)
+
+
+def create_and_run_duplicated_container(name,dup_port):
+    global ports,IMAGE_NAME,verbose,CP_NAME
+
+    _,pwd,_ = get_exitcode_stdout_stderr("pwd",False)
+    create_str = "docker create "   
+    for p in ports:    
+        if p.strip() not in (None, ""):
+            create_str += "-p "+dup_port+":"+p+" "
+    create_str+= "--name "+name+" "+IMAGE_NAME
+    
+    print("creating duplicated container...")
+    create_ecode,create_out,create_err = get_exitcode_stdout_stderr(create_str,verbose)
+    print("Done ("+name+")\n")
+    
+    print("starting duplicated container...")
+    start_ecode,start_out,start_err = get_exitcode_stdout_stderr("docker start "+
+                                                                "--checkpoint-dir="+pwd+" "+
+                                                                "--checkpoint="+ CP_NAME+" "+name,verbose)
+    print("Done\n")
+
+def on_release(key):
+    global ctrl_pressed
+    if key == Key.ctrl:
+        ctrl_pressed = False
+    if key == Key.esc: # Stop listener
+        return False
+
+
+if __name__ == "__main__":
+    main()
